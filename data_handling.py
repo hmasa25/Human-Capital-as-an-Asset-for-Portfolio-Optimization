@@ -2,8 +2,91 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import pulp as pl
+from sklearn.covariance import LedoitWolf
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
+def get_log_r_df():
+    rdata = pd.read_csv(r"data\return_data.csv", index_col=0)
+    columns = ['wage_us','LQD','ACWI','BTC-USD']
+    mapping = {
+        "wage_us": "Wage",
+        "LQD"    : "Corp. Bond",
+        "ACWI"   : "Stock",
+        "BTC-USD": "Crypto",
+    }
+    asset_names = [val for val in mapping.values()]
+    rtdata = rdata[columns].rename(columns=mapping)
+    print(f"data period: start={rdata.index[0]}, end={rdata.index[-1]}")
+    print(f"asset names: {rtdata.columns.to_list()}")
+    logr_df = np.log(rtdata).diff().dropna()
 
+    return logr_df
+
+def get_simulated(T, I, initial_asset_price = 1.0, rf_rate=0.001, seed=42):
+    np.random.seed(seed)
+
+    logr_df = get_log_r_df()
+    asset_names = logr_df.columns.to_list()
+    logr_t = np.array_split(logr_df.to_numpy(), T)
+
+    sim_all = []
+    for t in range(T):
+        mu = logr_t[t].mean(axis=0)
+        mu[0] = 0.0
+        cov_ledoit = LedoitWolf().fit(logr_t[t]).covariance_
+        sim = np.random.multivariate_normal(mean=mu, cov=cov_ledoit, size=(I,))
+        sim_all.append(pd.DataFrame(sim, columns=asset_names))
+
+    sim_df = pd.concat(sim_all, axis=1)
+    cols_temp = pd.MultiIndex.from_product([range(1, T+1), asset_names], names=["t", "asset"])
+    sim_df.columns = cols_temp
+    sim_df.index = pd.Index(range(1,I+1))
+    gross_r_df = np.expm1(sim_df) 
+    gross_r_df = pd.DataFrame(gross_r_df,index=sim_df.index,columns=sim_df.columns)
+
+    dfs = []
+    for asset in asset_names:
+        gross_a_df = (1+gross_r_df).xs(key=asset, axis=1, level="asset").copy()
+        if "Wage" in asset:
+            display(gross_a_df)
+            w_std_df = gross_a_df * 1
+            w_std_df.index.name = "path"
+            continue
+        gross_a_df[0] = initial_asset_price
+        gross_a_df.sort_index(axis=1, inplace=True)
+        rho_a_df = gross_a_df.cumprod(axis=1)
+        dfs.append(rho_a_df)
+
+    rho_df = pd.concat(dfs, axis=1)
+    cols_new = pd.MultiIndex.from_product([asset_names[1:], range(0, T+1)], names=["asset", "t"])
+    rho_df.columns = cols_new
+
+    if not bool(rf_rate):
+        return w_std_df, rho_df
+    
+    std = 1e-6
+    R = np.random.normal(loc=rf_rate, scale=std, size=(I,T))
+    r_df = pd.DataFrame(R, index=pd.Index(range(1,I+1)))
+    
+    return w_std_df, r_df, rho_df
+
+def set_params(m, T, W_E=None, base=None, hyparam=None, max_T=12):
+    base = 100.0
+    hyparam = 5.0
+    W_0 = (max_T/T) * (base * (1 + 1/T))
+    W_E = (base * (max_T**2)) * (T/max_T) 
+    W_G = W_E * 0.7
+    H_0 = base ** (1 + 1/max_T)   
+    dep_all = []
+    for t in range(1, max_T+1):
+        if t - (max_T - T) - 1  < 0:
+            continue
+        d = np.exp(hyparam * 1/t)/(1+np.exp(hyparam * 1/t))
+        dep_all.append(np.array([0.7 * d**ell  for ell in range(1,m+1)]))
+    dep_df = pd.DataFrame(dep_all, columns=[f"d_{ell}" for ell in range(1,m+1)], index=[t for t in range(1,T+1)]).T 
+
+    return W_0, W_E, W_G, H_0, dep_df
 
 def make_jitter(index: pd.Index, sigma: float = 1e-6, seed: int | None = 42) -> pd.Series:
     """
@@ -93,7 +176,7 @@ def data_download(mapping, T=10, start="2008-01-01", end=None,
     def annual_to_monthly_rate(apr):
         return (1 + apr)**(1/12) - 1
     if include_jpy_cash:
-        base_jpy = pd.Series(annual_to_monthly_rate(0.001), index=dl.index)  # 0.1%
+        base_jpy = pd.Series(0.001, index=dl.index)  # 0.1%
         jitter_jpy = make_jitter(dl.index, sigma=1e-6, seed=100) 
         r_jpy = base_jpy.add(jitter_jpy)
         ret_cols[jpy_cash_name] = r_jpy
@@ -224,7 +307,7 @@ def get_simulated_rets(exval_std_df, corr_df, n_paths=500):
 
     return simulated
 
-def get_gross_rets(simulated, asset_names, initial_call_rate=0.000083, initial_asset_price=1.0, ):
+def get_gross_rets(simulated, asset_names, initial_call_rate=0.001, initial_asset_price=1.0, ):
     simulated_by_asset = {asset: simulated.xs(asset, axis=1, level="資産名") for asset in simulated.columns.get_level_values("資産名").unique()}
     T = simulated.columns.get_level_values("期間").max()
     variables_columns = pd.MultiIndex.from_product([asset_names, [t for t in range(T+1)]],names=["資産名", "期間"])
@@ -348,3 +431,194 @@ def generate_variables(T, I, asset_names):
             H_df.loc[i, t] = pl.LpVariable(f"H_{i}_{t}")
     
     return z_df, Pplus_df, Pminus_df, v_0, h_0, v_df, h_df, q_df, y_df, H_df
+
+def simulate_random_shocks(T=500, p=0.05, mu=0.0, std=1.0, seed=42):
+    """
+    T: シミュレーション期間
+    p: ショックの発生確率（Bernoulli）
+    mu: 正規分布の平均
+    sigma: 半正規分布のスケール
+    """
+    np.random.seed(seed)
+
+    # ショックが起こるかどうか（0/1）
+    shock_occurrence = np.random.binomial(1, p, size=T)
+
+    # 半正規分布（正規分布の絶対値）
+    shock_size = - np.abs(np.random.normal(loc=mu, scale=std, size=T))
+
+    # ショックが起こった時だけ値を残し、起きなかった時は0にする
+    shocks = shock_occurrence * shock_size
+
+    return shocks, shock_occurrence, shock_size
+
+def simulate_ai_regimes(transition_matrix, T, initial_state=None, seed=42):
+    np.random.seed(seed)
+    states = [0, 1]
+    if initial_state is None:
+        initial_state = [1.0, 0.0] 
+
+    current_state = np.random.choice(states, p=initial_state)
+    regime_sequence = [current_state]
+
+    for _ in range(1, T):
+        current_state = np.random.choice(states,p=transition_matrix[current_state])
+        regime_sequence.append(current_state)
+
+    return np.array(regime_sequence)
+
+def simulate_wage(wage_n, wage_ai, w_std_df, transition_matrix, T, seed=50):
+    rng = np.random.default_rng(seed)
+    K = len(wage_n)
+    SCEN = w_std_df.index.to_list()
+    I = max(SCEN)
+
+    wages = []
+
+    for i, child_seed in zip(SCEN, rng.integers(0, 2**32, size=len(w_std_df.index))):
+
+        regime_sequence =  simulate_ai_regimes(transition_matrix, T, initial_state=None, seed=child_seed)
+        mask = regime_sequence == 1
+        error = np.tile(w_std_df.loc[i,:].to_numpy(), (K, 1))
+        wage_ai_regime = np.maximum(error[:,mask] + wage_ai.T[:,None], 0.0)
+
+        wage_normal_regime = error[:,~mask] + wage_n.T[:,None]
+        if regime_sequence[0] == 1:
+            wage_i_all = np.hstack([wage_ai_regime, wage_normal_regime])
+        else:
+            wage_i_all = np.hstack([wage_normal_regime, wage_ai_regime])
+        wage_i_df = pd.DataFrame(wage_i_all, columns=np.arange(1,T+1), index=[f"wage{i+1}" for i in range(K)])
+        wages.append(wage_i_df)
+    wage_df = pd.concat(wages, axis=0)
+    wage_df.index = pd.MultiIndex.from_product([pd.Index(range(1,I+1)),[f"wage{i+1}" for i in range(K)]], names=["path", "wage level"]) 
+    return wage_df
+
+def visualize_wage(T, I, wage_df):
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8), sharex=True, sharey=True)
+    axes = axes.flatten()
+
+    cmap = plt.get_cmap("tab10")
+    regime_colors = {
+        "Normal": cmap(0),
+        "AI": cmap(1),
+    }
+
+    for ax, i in zip(axes, range(1, 7)):   # ← 6個だけ
+        prev_sum = None
+        regime = "Normal"
+        t_handles = []
+
+        for t in range(1, T+1):
+            wage_t = wage_df.xs(i, level="path")[t]
+            t_sum = wage_t.sum()
+
+            # Regime 判定（トグル）
+            if prev_sum is not None and abs(t_sum - prev_sum) > 10.0:
+                regime = "AI" if regime == "Normal" else "Normal"
+
+            color = regime_colors[regime]
+            wage_t.plot(ax=ax, color=color)
+
+            # t 凡例
+            t_handles.append(
+                Line2D([0], [0], color=color, lw=2, label=f"t={t}")
+            )
+
+            prev_sum = t_sum
+
+        # ---- 各 subplot の設定
+        ax.set_title(f"path = {i}")
+        ax.set_xlabel("wage level")
+        ax.set_ylabel("wage")
+
+        # Regime 凡例
+        regime_handles = [
+            Line2D([0], [0], color=regime_colors["Normal"], lw=3, label="Normal"),
+            Line2D([0], [0], color=regime_colors["AI"], lw=3, label="AI"),
+        ]
+
+        legend1 = ax.legend(
+            handles=regime_handles,
+            title="Regime",
+            loc="upper left"
+        )
+        ax.add_artist(legend1)
+
+        # Period 凡例
+        ax.legend(
+            handles=t_handles,
+            title="Period",
+            loc="upper left",
+            bbox_to_anchor=(0.25, 0.99),
+            ncol=2,
+            fontsize=8
+        )
+
+    plt.tight_layout()
+    plt.show()
+
+def visualize_Wt(I, W_E, W_G, Wt_max, T):
+
+
+    model_colors = {
+        "H":  "tab:blue",
+        "50": "tab:orange",
+        "F":  "tab:green",
+    }
+
+    dfs = []
+    for mdl in Wt_max.keys():
+        if mdl == "H":
+            dfs.append(pd.DataFrame(Wt_max[mdl], index=[mdl]))
+        else:
+            dfs.append(
+                pd.DataFrame(
+                    Wt_max[mdl],
+                    index=[f"{mdl}_{i}" for i in range(1, I+1)]
+                )
+            )
+
+    plot_df = pd.concat(dfs, axis=0).T[0:T+1]
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    # --- 各行（戦略×パス）を描画 ---
+    for col in plot_df.columns:
+        base_mdl = col.split("_")[0]  # "50_3" → "50"
+        ax.plot(
+            plot_df.index,
+            plot_df[col],
+            color=model_colors[base_mdl],
+            alpha=0.25 if base_mdl != "H" else 1.0,  # Hは代表1本なので濃く
+            linewidth=1.5
+        )
+
+    # --- 目標ライン ---
+    ax.axhline(y=W_E, color="red", linestyle="--", linewidth=2)
+    ax.axhline(y=W_G, color="black", linestyle=":", linewidth=2)
+
+    # --- 凡例（モデル単位 + 目標）を手動作成 ---
+    legend_handles = [
+        Line2D([0], [0], color=model_colors["H"],  lw=2, label="H strategy"),
+        Line2D([0], [0], color=model_colors["50"], lw=2, label="50 strategy"),
+        Line2D([0], [0], color=model_colors["F"],  lw=2, label="F strategy"),
+        Line2D([0], [0], color="red",   lw=2, linestyle="--", label="W_E"),
+        Line2D([0], [0], color="black", lw=2, linestyle=":",  label="W_G"),
+    ]
+
+    ax.legend(
+        handles=legend_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.18),   # ← グラフ下
+        ncol=5,
+        frameon=False
+    )
+
+    ax.set_title("Theoretical Max Wealth (3 Strategies)")
+    ax.set_xlabel("t")
+    ax.set_ylabel("Wealth")
+
+    plt.tight_layout()
+    plt.show()
+
+

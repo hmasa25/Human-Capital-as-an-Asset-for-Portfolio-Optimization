@@ -1,47 +1,119 @@
-from pyscipopt import Model, quicksum
+from pyscipopt import Model, quicksum, SCIP_PARAMEMPHASIS
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
+from pathlib import Path
 
 
-def compute_bounds_and_M(T, H0, depreciation, h_cap):
-    dep = list(map(float, depreciation))  # [d1..dm]
-    m = len(dep)
-    H_min = {t: float(H0) for t in range(1, T+1)}
-    H_max = {t: float(H0) for t in range(1, T+1)}
+def wage_function(thresholds, Ht, wage_df, t):
+    K = len(thresholds) + 1 
+    for k in range(K - 1):
+        if Ht < thresholds[k]:
+            return wage_df.loc[f"wage{k+1}", t]
+
+    return wage_df.loc[f"wage{K}", t]
+
+
+def compute_bounds_and_M(I, T, H_0, W_0, dep_df, thresholds, shocks_H, asset_names, rho_df, wage_df, wage_n=None): 
+    m = dep_df.shape[0]
+    H_min = {t: H_0 + shocks_H[t-1] for t in range(1, T+1)}
+    H_max = {t: H_0 for t in range(1, T+1)}
+    yt_max = {t: 0.0 for t in range(1, T+1)}
+    Wt_max = {
+        "H":{t: 0.0 for t in range(0, T+1)},
+        "50":{t: 0.0 for t in range(0, T+1)},
+        "F":{t: 0.0 for t in range(0, T+1)}
+               }
+    Wt_5050 = {t:[] for t in range(0, T+1)}
+
+    Wt_max["H"][0] = W_0
+    Wt_max["50"][0] = np.array([W_0]*I)
+    Wt_max["F"][0] = np.array([W_0]*I)
+    Wt_5050[0] = [W_0*0.5, W_0*0.5]
+
+    K = len(thresholds) + 1 
+    
+    if wage_n is None:
+        wage_k = []
+        for k in range(1,K+1):
+            wage_k.append(wage_df.xs(f"wage{k}", level="wage level").mean(axis=0))
+        ave_wage_df = pd.concat(wage_k, axis=1).T
+        ave_wage_df.index = [f"wage{k}" for k in range(1,K+1)]
+        print("Average Wage: Simulated")
+        display(ave_wage_df)
+
+    else:
+        ave_wage_df=pd.DataFrame(np.tile(wage_n, (T,1)), index=pd.Index(range(1,T+1)),columns=[f"wage{k}" for k in range(1,K+1)]).T
+        print("Average Wage: Normal Regime")
+        display(ave_wage_df)
+
+
+    # t == 1 
+    H1 = H_0 + dep_df.loc["d_1", 1]*W_0
+    yt_max[1] = wage_function(thresholds, Ht=H1, wage_df=ave_wage_df, t=1)
+
     for t in range(1, T+1):
+        dep = list(map(float, dep_df[t].values))
         ub = 0.0
+        ub_50 = 0.0
         for ell in range(1, m+1):
             tm = t - ell
             if tm >= 0:  # tm==0 means h0
-                ub += dep[ell-1] * h_cap
-        H_max[t] = float(H0) + ub
-    M_t = {t: H_max[t] - H_min[t] for t in range(1, T+1)}  # per-period M
-    return H_min, H_max, M_t
+                ub += dep[ell-1] * Wt_max["H"][t-1]
+                ub_50 += dep[ell-1] * 0.5 * Wt_max["50"][t-1]
+
+        H_max[t] = H_0 + ub + shocks_H[t-1]
+        Ht_50 = H_0 + ub_50 + shocks_H[t-1]
+        yt_max[t] = wage_function(thresholds, Ht=H_max[t], wage_df=ave_wage_df, t=t)
+        Wt_max["H"][t] = (yt_max[t])
+        if isinstance(Ht_50, list):
+            yt_50 = []
+            for Ht in Ht_50:       
+                yt_50.append(wage_function(thresholds, Ht=Ht, wage_df=ave_wage_df, t=t))
+        else:
+            yt_50 = wage_function(thresholds, Ht=H1, wage_df=ave_wage_df, t=t)
+        
+        max_candidates = []
+        for asset in asset_names:
+            max_candidates.append(rho_df.loc[:, (asset)].pct_change(axis=1)[t].values)
+        financial_assets_max_rtn = np.vstack([max_candidates]).max(axis=0) 
+        financial_50 = (1+financial_assets_max_rtn) * 0.5 * Wt_max["50"][t-1]
+        Wt_max["50"][t] = financial_50 + yt_50
+        Wt_max["F"][t] = (1+financial_assets_max_rtn) * W_0
+        Wt_5050[t] = [financial_50, yt_50]
+        
+    M_t = {t: max(H_max[t] - thresholds[0], thresholds[-1] - H_min[t]) for t in range(1, T+1)}  # per-period M
+    return H_min, H_max, M_t, Wt_max, Wt_5050, yt_max
 
 def build_scip_model(
-    SCEN,              # list of scenario ids: [1..I]
-    TIME,              # list of periods: [1..T]
-    TIME_TR,           # trade periods: [1..T-1]
-    risk_assets,       # list of asset names (risky only)
-    rf_asset,          # name of risk-free (for reporting)
-    delta,             # tx cost
-    initial_call_rate, # cash growth for t=1
-    H0, thresholds, depreciation, m,      # HC parameters
-    beta,                              # [β1..β8]
-    W0, WE, WG,                        # wealth targets
-    rho_df, r_df, rho_bar_T,           # market data (pandas)
-    h_cap=None,                         # cap on h per period
-    share_u_t1=True,                    # share regime u across scenarios at t=1
-    link_yH_t1=False,                   # (optional) share y/H at t=1 across scenarios
-    time_limit=None, threads=6, msg=True
+    I,T,K,
+    asset_names,
+    delta,
+    H0, thresholds, 
+    dep_df, 
+    m,      
+    wage_df,
+    W0, WE, WG,                        # wealth params
+    M_t,
+    shock_H,                           # exogenous shocks to H per period (dict t->value)                                                           
+    rho_df, r_df,
+    initial_call_rate = 0.001,
+    h_cap=None,                         # cap on h per period    
+    time_limit=None,
+    feasibility=True,
+    slack=True
 ):
     """Return (model, var dicts) ready to solve in SCIP."""
 
-    K = len(beta)                      # number of segments (e.g., 8)
-    I = len(SCEN)
-    T = max(TIME)
+    SCEN = [i+1 for i in range(I)]       
+    TIME = list(range(1, T+1))
+    TIME_TR = list(range(1, T))
+
+    # Select columns for the last period
+    rho_last = rho_df.xs(T, level="t", axis=1)
+    # Calculate the mean across all paths (rows) for each asset
+    rho_bar_T = rho_last.mean(axis=0)
 
     # Sensible cap for h if not given
     if h_cap is None:
@@ -49,89 +121,47 @@ def build_scip_model(
 
     # taus = [τ0..τK] (length K+1), include lower and upper
     # Tight H bounds and per-period Big-M
-    H_min, H_max, M_t = compute_bounds_and_M(T, H0, depreciation, h_cap)
-
-    # Build strictly increasing taus (do NOT inject H0 twice)
-    EPS  = 1e-4
-    taus_raw = [float(x) for x in thresholds if x > H_min[1] + EPS and x < H_max[T] - EPS]
-    taus = [H_min[1]] + sorted(taus_raw) + [H_max[T]]
-    for j in range(1, len(taus)):
-        if taus[j] <= taus[j-1] + EPS:
-            taus[j] = taus[j-1] + EPS
-
-    K = len(taus) - 1
-    beta = list(map(float, beta))[:K]
-
-
     # --- SCIP model
     mdl = Model("Dynamic_Portfolio_with_HumanCapital_StepMILP")
-    mdl.setParam("display/verblevel", 4 if msg else 0)
-    mdl.setParam("parallel/maxnthreads", threads)
     if time_limit is not None:
-        mdl.setParam("limits/time", float(time_limit))
+        mdl.setParam("limits/time", time_limit)
+    if feasibility:
+        mdl.setEmphasis(SCIP_PARAMEMPHASIS.HARDLP)
 
     # -----------------------------
     # Variables
     # -----------------------------
-    # Risky inventory z[a,t] (units, t=0..T-1 in your PuLP; here we’ll store t in 0..T-1 for inventory)
-    z = {}                 # z[a,t]  t in 0..T-1
-    Pplus, Pminus = {}, {} # trades at t>=1
-    for a in risk_assets:
-        for t in range(0, T):  # inventory defined for 0..T-1
+    # Risky inventory z[a,t] (units, t=0..T-1 in your PuLP; here we'll store t in 0..T-1 for inventory)
+    z = {} ; h = {}                 # z[a,t]  t in 0..T-1
+    
+    for t in range(0, T):  # inventory defined for 0..T-1
+        h[t] = mdl.addVar(vtype="C", lb=0.0, name=f"h_{t}")
+        for a in asset_names:
             z[a, t] = mdl.addVar(vtype="C", lb=0.0, name=f"z_{a}_{t}")
-        for t in TIME_TR:      # trades at 1..T-1
-            Pplus[a, t]  = mdl.addVar(vtype="C", lb=0.0, name=f"Pplus_{a}_{t}")
-            Pminus[a, t] = mdl.addVar(vtype="C", lb=0.0, name=f"Pminus_{a}_{t}")
 
     # Cash v[i,t], human-cap invest h[i,t], q[i]
-    v = {} ; h = {} ; q = {}
+    v = {} ; q = {} ; y = {}
     for i in SCEN:
-        for t in TIME:
-            v[i, t] = mdl.addVar(vtype="C", lb=0.0, name=f"v_{i}_{t}")
-            h[i, t] = mdl.addVar(vtype="C", lb=0.0, ub=h_cap, name=f"h_{i}_{t}")
         q[i] = mdl.addVar(vtype="C", lb=0.0, name=f"q_{i}")
-
-    # Initial cash & h
-    v0 = mdl.addVar(vtype="C", lb=0.0, name="v0")
-    h0 = mdl.addVar(vtype="C", lb=0.0, ub=h_cap, name="h0")
-
-    # H[i,t], y[i,t]
-    H = {} ; y = {}
-    for i in SCEN:
         for t in TIME:
-            H[i, t] = mdl.addVar(vtype="C", name=f"H_{i}_{t}")
-            y[i, t] = mdl.addVar(vtype="C", lb=0.0, name=f"y_{i}_{t}")
+            v[i, t] = mdl.addVar(vtype="C", lb=0.0, name=f"v_{i}_{t}") 
+            y[i, t] = mdl.addVar(vtype="C", lb=0.0, name=f"y_{i}_{t}")    
 
+    # Initial cash
+    v0 = mdl.addVar(vtype="C", lb=0.0, name="v0")
+
+    # H[t], y[t]
+    H = {} 
+    for t in TIME:    
+        H[t] = mdl.addVar(vtype="C", name=f"H_{t}")
+        
     # Regime binaries u[(i,t,k)], with shared t=1 option
     u = {}
-    if share_u_t1:
-        u_t1 = {k: mdl.addVar(vtype="B", name=f"u_t1_{k}") for k in range(1, K+1)}
-        for i in SCEN:
-            for k in range(1, K+1):
-                u[i, 1, k] = u_t1[k]
-    else:
-        for i in SCEN:
-            for k in range(1, K+1):
-                u[i, 1, k] = mdl.addVar(vtype="B", name=f"u_{i}_1_{k}")
-    for i in SCEN:
-        for t in TIME:
-            if t == 1: 
-                continue
-            for k in range(1, K+1):
-                u[i, t, k] = mdl.addVar(vtype="B", name=f"u_{i}_{t}_{k}")
+    for t in TIME:
+        for k in range(1, K+1):
+            u[t, k] = mdl.addVar(vtype="B", name=f"u_{t}_{k}")
 
-    # Optionally link y/H at t=1 (shared across scenarios)
-    if link_yH_t1:
-        # use i0 as reference
-        i0 = SCEN[0]
-        for i in SCEN[1:]:
-            mdl.addCons(y[i,1] == y[i0,1], name=f"link_y_t1_i{i}")
-            mdl.addCons(H[i,1] == H[i0,1], name=f"link_H_t1_i{i}")
-
-    # -----------------------------
-    # Objective
-    # -----------------------------
-    mdl.setObjective( (1.0/len(SCEN)) * quicksum(q[i] for i in SCEN), "minimize")
+    print("variables added")
 
     # -----------------------------
     # Constraints
@@ -140,85 +170,112 @@ def build_scip_model(
     # If you have per-asset initial price, use it; else use 1.0 as you did.
     initial_asset_price = 1.0
     mdl.addCons(
-        quicksum((1+delta)*initial_asset_price * z[a,0] for a in risk_assets) + v0 + h0 == float(W0),
+        quicksum((1+delta)*initial_asset_price * z[a,0] for a in asset_names) + v0 + h[0] == W0,
         name="InitialBudget"
     )
 
-    # Inventory dynamics: z[a,t] = z[a,t-1] + Pplus[a,t] - Pminus[a,t]
-    for a in risk_assets:
-        for t in TIME_TR:
-            mdl.addCons(z[a, t] == z[a, t-1] + Pplus[a, t] - Pminus[a, t], name=f"InvDyn_{a}_{t}")
+    print("initial budget constraint added")
 
     # Per-scenario budgets t=1..T-1
     for i in SCEN:
         for t in TIME_TR:
-            buy_cost  = quicksum( (1+delta)* rho_df.loc[i, (a, t)].values[0] * Pplus[a, t]  for a in risk_assets )
-            sell_cash = quicksum( (1-delta)* rho_df.loc[i, (a, t)].values[0] * Pminus[a, t] for a in risk_assets )
+            buy_cost  = quicksum( (1+delta)* rho_df.loc[i, (a, t)] * z[a, t] for a in asset_names )
+            sell_cash = quicksum( (1-delta)* rho_df.loc[i, (a, t)] * z[a, t-1] for a in asset_names )
             if t == 1:
-                rhs = sell_cash + (1+float(initial_call_rate))*v0 + y[i,1]
+                rhs = sell_cash + (1+initial_call_rate)*v0 + y[i, 1]
             else:
-                rhs = sell_cash + (1+ r_df.loc[i, t-1].values[0])*v[i, t-1] + y[i, t]
-            mdl.addCons(buy_cost + v[i, t] + h[i, t] == rhs, name=f"Budget_{i}_{t}")
-
+                rhs = sell_cash + (1+ r_df.loc[i, t-1])*v[i, t-1] + y[i,t]
+            mdl.addCons(buy_cost + v[i, t] + h[t] == rhs, name=f"Budget_{i}_{t}")
+    print("per-scenario budget constraints added")
     # Human Capital dynamics:
     # H[i,t] = H0 + sum_{ell=1..m} d_ell * h[i, t-ell], with t-ell==0 → h0, <0 → ignore
-    dep = list(map(float, depreciation))
-    for i in SCEN:
-        for t in TIME:
-            terms = []
-            for ell, d_ell in enumerate(dep, start=1):
-                tm = t - ell
-                if tm > 0:
-                    terms.append(d_ell * h[i, tm])
-                elif tm == 0:
-                    terms.append(d_ell * h0)
-            mdl.addCons(H[i,t] == float(H0) + quicksum(terms) if terms else float(H0), name=f"Hdyn_{i}_{t}")
-
+    for t in TIME:
+        dep = list(map(float, dep_df[t].values))
+        terms = []
+        for ell, d_ell in enumerate(dep, start=1):
+            tm = t - ell
+            if tm >= 0:
+                terms.append(d_ell * h[tm])
+            else:
+                break
+        mdl.addCons(H[t] == H0 + quicksum(terms) + shock_H[t-1] if terms else H0, name=f"Hdyn_{t}")
+    print("HC dynamics constraints added")
     # One-hot regime selection
     # t=1: once if shared, otherwise per scenario; t>=2: per (i,t)
-    if share_u_t1:
-        mdl.addCons(quicksum(u[SCEN[0], 1, k] for k in range(1, K+1)) == 1, name="OneSeg_t1_shared")
-        # all u[i,1,k] point to same var objects, so no extra constraints needed
-    else:
-        for i in SCEN:
-            mdl.addCons(quicksum(u[i, 1, k] for k in range(1, K+1)) == 1, name=f"OneSeg_{i}_1")
-    for i in SCEN:
-        for t in TIME:
-            if t == 1: 
-                continue
-            mdl.addCons(quicksum(u[i, t, k] for k in range(1, K+1)) == 1, name=f"OneSeg_{i}_{t}")
-
+    for t in TIME:
+        mdl.addCons(quicksum(u[t, k] for k in range(1, K+1)) == 1, name=f"OneSeg_{t}")
+    print("one-hot regime selection constraints added")
     # Big-M bracketing: τ_{k-1} <= H[i,t] < τ_k when u[i,t,k]=1 (relaxed otherwise with M_t)
+    EPS = 1e-6
+    for t in TIME:
+        Ht = H[t]
+        for k in range(1, K+1):
+            if k == 1:
+                tau = thresholds[0]
+                mdl.addCons(Ht <= (tau - EPS) + M_t[t]*(1 - u[t, k]), name=f"Hhi_{t}_{k}")
+            elif k == K:
+                tau = thresholds[-1]
+                mdl.addCons(Ht >= tau - M_t[t]*(1 - u[t, k]), name=f"Hlo_{t}_{k}")
+            else:
+                tau_lo = thresholds[k-2]; tau_hi = thresholds[k-1]
+                mdl.addCons(Ht >= tau_lo - M_t[t]*(1 - u[t, k]), name=f"Hlo_{t}_{k}")
+                mdl.addCons(Ht <= (tau_hi - EPS) + M_t[t]*(1 - u[t, k]), name=f"Hhi_{t}_{k}")
+    print("Big-M regime bracketing constraints added")
     for i in SCEN:
         for t in TIME:
-            Mt = float(M_t[t])
-            Hit = H[i, t]
-            for k in range(1, K+1):
-                tau_lo = float(taus[k-1]); tau_hi = float(taus[k])
-                mdl.addCons(Hit >= tau_lo - Mt*(1 - u[i, t, k]), name=f"Hlo_{i}_{t}_{k}")
-                mdl.addCons(Hit <= (tau_hi - EPS) + Mt*(1 - u[i, t, k]), name=f"Hhi_{i}_{t}_{k}")
-
-    # Income selection: y[i,t] = sum_k beta[k-1]*u[i,t,k]
-    beta = list(map(float, beta))  # [β1..βK]
-    for i in SCEN:
-        for t in TIME:
-            mdl.addCons(y[i, t] == quicksum(beta[k-1] * u[i, t, k] for k in range(1, K+1)), name=f"Ymap_{i}_{t}")
-
+            mdl.addCons(y[i,t] == quicksum(wage_df.loc[i,t][f"wage{k}"] * u[t, k] for k in range(1, K+1)), name=f"Ymap_{i}_{t}")
+    print("wage mapping constraints added")
     # Expected terminal wealth:
     #   sum_a (1-δ) * rho_bar_T[a] * z[a, T-1] + (1/I) * sum_i {(1+r[i,T-1])*v[i,T-1] + y[i,T]} >= WE
-    term_left_risky = quicksum( (1-delta)*float(rho_bar_T[a]) * z[a, T-1] for a in risk_assets )
-    term_left_cash  = (1.0/len(SCEN)) * quicksum( (1+r_df.loc[i, T-1].values[0])*v[i, T-1] + y[i, T] for i in SCEN )
-    mdl.addCons(term_left_risky + term_left_cash >= float(WE), name="ExpTerminal")
+    term_left_risky = quicksum( (1-delta)*float(rho_bar_T[a]) * z[a, T-1] for a in asset_names )
+    term_left_cash  = (1.0/len(SCEN)) * quicksum( (1+r_df.loc[i, T-1])*v[i, T-1] + y[i, T] for i in SCEN )
 
+    orig_obj = (1.0/len(SCEN)) * quicksum(q[i] for i in SCEN)
     # Pathwise terminal goal per scenario
+    risky_T = {} ; cash_T = {}
     for i in SCEN:
-        risky_T = quicksum( (1-delta)* rho_df.loc[i, (a, T)].values[0]  * z[a, T-1] for a in risk_assets )
-        cash_T  = (1+ r_df.loc[i, T-1].values[0])*v[i, T-1] + y[i, T]
-        mdl.addCons(risky_T + cash_T + q[i] >= float(WG), name=f"PathGoal_{i}")
+        risky_T[i] = quicksum( (1-delta)* rho_df.loc[i, (a, T)]  * z[a, T-1] for a in asset_names )
+        cash_T[i]  = (1+ r_df.loc[i, T-1])*v[i, T-1] + y[i, T]
+    
+    if not slack:
+        mdl.addCons(term_left_risky + term_left_cash >= float(WE), name="ExpTerminal")
+        print("expected terminal wealth constraint added")
 
-    return mdl, dict(z=z, Pplus=Pplus, Pminus=Pminus, v=v, h=h, v0=v0, h0=h0, H=H, y=y, q=q, u=u)
+        for i in SCEN:
+            mdl.addCons(risky_T[i] + cash_T[i] + q[i] >= float(WG), name=f"PathGoal_{i}")
+        print("pathwise terminal goal constraints added")
 
-def solve_and_extract(mdl, vars, SCEN, TIME, risk_assets):
+        mdl.setObjective( orig_obj, "minimize")
+        print("objective set")
+
+        vars = dict(z=z, v=v, h=h, v0=v0, H=H, y=y, q=q, u=u)
+
+    else:
+        s_exp = mdl.addVar(name="s_ExpTerminal", vtype="C", lb=0.0)  # 期待終端富用
+        s_path = {i: mdl.addVar(name=f"s_PathGoal_{i}", vtype="C", lb=0.0) for i in SCEN}
+
+        # --- ExpTerminal（平均的な終端富） ---
+        mdl.addCons(term_left_risky + term_left_cash + s_exp >= float(WE), name="ExpTerminal_soft")
+        print("expected terminal wealth constraint with slack added")
+
+        # --- PathGoal（各シナリオの終端富） ---
+        for i in SCEN:
+            mdl.addCons(risky_T[i] + cash_T[i] + q[i] + s_path[i] >= float(WG), name=f"PathGoal_soft_{i}")
+        print("pathwise terminal goal constraints with slack added")
+        
+        M = 1e6
+        mdl.setObjective(orig_obj+ M * (s_exp + quicksum(s_path[i] for i in SCEN)), "minimize")
+        print("Modified objective with slack penalties")
+
+        vars = dict(z=z, v=v, h=h, v0=v0, H=H, y=y, q=q, u=u, s_exp=s_exp, s_path=s_path)
+
+    return mdl, vars
+
+def solve_and_extract(mdl, vars, I, T, asset_names, slack=True):
+    
+    SCEN = [i+1 for i in range(I)]       
+    TIME = list(range(1, T+1))
+
     mdl.optimize()
 
     status = mdl.getStatus()
@@ -231,69 +288,71 @@ def solve_and_extract(mdl, vars, SCEN, TIME, risk_assets):
 
     sol = mdl.getBestSol()
     def val(x): return mdl.getSolVal(sol, x) if x is not None else np.nan
+    
+    if slack:
+        s_exp = vars["s_exp"]
+        s_path = vars["s_path"]
 
+        print("s_exp =", val(s_exp))
+        for i in SCEN:
+            print(f"scenario {i}: s_path =", val(s_path[i]))
+    
     # Unpack
     z = vars["z"]; v = vars["v"]; h = vars["h"]; H = vars["H"]; y = vars["y"]
-    v0 = vars["v0"]; h0 = vars["h0"]; u = vars["u"]
-
-    # z (a,t=0..T-1)
-    Tmax = max(TIME)
-    z_df = pd.DataFrame(index=["z_jt"],
-                        columns=pd.MultiIndex.from_product([risk_assets, range(0, Tmax)]))
-    for a in risk_assets:
-        for t in range(0, Tmax):
-            z_df.at["z_jt", (a, t)] = val(z[a, t])
+    v0 = vars["v0"]; u = vars["u"]
 
     # v,h,H,y (i,t=1..T)
     idx  = pd.Index(SCEN, name="i")
     cols = pd.Index(TIME, name="t")
+
+    # z (a,t=0..T-1)
+    Tmax = max(TIME)
+    z_df = pd.DataFrame(index=["z_jt"],
+                        columns=pd.MultiIndex.from_product([asset_names, range(0, Tmax)]))
+    h_df = pd.DataFrame(index=["ht"], columns=[t for t in range(0, Tmax)], dtype=float)
+   
+    for t in range(0, Tmax):
+        h_df.at["ht", t] = val(h[t])
+        for a in asset_names:
+            z_df.at["z_jt", (a, t)] = val(z[a, t])
+
     v_df = pd.DataFrame(index=idx, columns=cols, dtype=float)
-    h_df = pd.DataFrame(index=idx, columns=cols, dtype=float)
-    H_df = pd.DataFrame(index=idx, columns=cols, dtype=float)
-    y_df = pd.DataFrame(index=idx, columns=cols, dtype=float)
-    for i in SCEN:
-        for t in TIME:
+    y_df = pd.DataFrame(index=idx, columns=cols, dtype=float)    
+    H_df = pd.DataFrame(index=["Ht"], columns=cols, dtype=float)
+    
+
+    for t in TIME:
+        H_df.loc["Ht", t] = val(H[t])   
+        for i in SCEN:
             v_df.loc[i, t] = val(v[i, t])
-            h_df.loc[i, t] = val(h[i, t])
-            H_df.loc[i, t] = val(H[i, t])
             y_df.loc[i, t] = val(y[i, t])
 
     v0_val = val(v0)
-    h0_val = val(h0)
 
     # ===== NEW: extract binaries u_{i,t,k} =====
     # Find all k present
-    Ks = sorted({k for (_, _, k) in u.keys()})
+    Ks = sorted({k for (_, k) in u.keys()})
     # Build DataFrame indexed by (i,t), columns = k
-    u_index = pd.MultiIndex.from_product([SCEN, TIME], names=["i", "t"])
-    u_cols  = [f"k={k}" for k in Ks]
-    u_df = pd.DataFrame(index=u_index, columns=u_cols, dtype=float)
+    u_idx  = [f"k={k}" for k in Ks]
+    u_df = pd.DataFrame(index=u_idx, columns=cols, dtype=float)
 
-    for i in SCEN:
-        for t in TIME:
-            for k in Ks:
-                val_ = val(u.get((i, t, k)))  # shared t=1 binaries are same object across i
-                u_df.loc[(i, t), f"k={k}"] = val_
-
-    # Chosen segment per (i,t): argmax; robust to tiny float noise
-    u_choice = u_df.astype(float).copy()
-    # optional: clip to [0,1] then threshold small magnitudes
-    u_choice = u_choice.clip(lower=0.0, upper=1.0)
-    chosen_k = u_choice.idxmax(axis=1).str.replace("k=", "", regex=False).astype(int)
+    for t in TIME:
+        for k in Ks:
+            u_df.loc[f"k={k}", t] = val(u[t, k])
 
     return dict(status=status, obj=mdl.getSolObjVal(sol), z=z_df, v=v_df, h=h_df, H=H_df, y=y_df,
-                v0=v0_val, h0=h0_val, u=u_df, u_choice=chosen_k)
+                v0=v0_val, u=u_df)
 
-def investment_ratio(rho_df, asset_names, sol, v0_val, h0_val, v_val, h_val, z_val, SCEN, T, W_0, W_E, W_G):
+def investment_ratio(rho_df, asset_names, sol, v0_val, v_val, h_val, z_val, I, T, W_0, W_E, W_G, param_type):
     # === Precompute average prices as a simple DataFrame ===
+    SCEN = [i+1 for i in range(I)]       
+
     # rho_df: rows = scenarios i, columns = MultiIndex (資産名, 期間)
     avg_price = rho_df.mean(axis=0)                 # Series indexed by (asset, period)
     price_df  = avg_price.unstack(level=-1)
              # rows: 資産名, cols: 期間
-    risk_assets = asset_names[1:]
-    rf_asset = asset_names[0]
-    assets = list(risk_assets)
-    all_cols = [rf_asset, "人的資本"] + assets
+    rf_asset = "Cash"
+    all_cols = [rf_asset, "Human Cap"] + asset_names
 
     # Detect whether price periods are 0..T-1 or 1..T and map accordingly
     price_cols = price_df.columns
@@ -304,7 +363,7 @@ def investment_ratio(rho_df, asset_names, sol, v0_val, h0_val, v_val, h_val, z_v
     status_ok = (sol.get("status") == "optimal") and (sol.get("obj") is not None)
 
     if not status_ok:
-        print("投資比率は計算できません")
+        print("cannnot calculate investment weights")
     else:
         # Compute weights normally
         weights = pd.DataFrame(
@@ -317,25 +376,29 @@ def investment_ratio(rho_df, asset_names, sol, v0_val, h0_val, v_val, h_val, z_v
             tt = t + use_offset
             risky_val_t = sum(
                 float(price_df.at[a, tt]) * float(z_val.loc["z_jt", (a, t)])
-                for a in assets
+                for a in asset_names
             )
 
             if t == 0:
-                cash_vec = pd.Series(v0_val, index=SCEN, dtype=float)
-                h_vec    = pd.Series(h0_val, index=SCEN, dtype=float)
+                cash_vec = v0_val
             else:
                 cash_vec = v_val.loc[SCEN, t].astype(float)
-                h_vec    = h_val.loc[SCEN, t].astype(float)
-
+            h_vec = h_val.loc["ht", t].astype(float)
             denom = risky_val_t + cash_vec + h_vec
-            denom_pos = denom.where(denom > 0, other=np.nan)
-
-            weights.loc[(slice(None), t), rf_asset]   = (cash_vec / denom_pos).values
-            weights.loc[(slice(None), t), "人的資本"] = (h_vec / denom_pos).values
-
-            for a in assets:
-                num = float(price_df.at[a, tt]) * float(z_val.loc["z_jt", (a, t)])
-                weights.loc[(slice(None), t), a] = (num / denom_pos).values
+            #denom_pos = denom.where(denom > 0, other=np.nan)
+            #print((cash_vec / denom_pos))
+            if t == 0:
+                weights.loc[(slice(None), 0), rf_asset]   = (cash_vec / denom)
+                weights.loc[(slice(None), 0), "Human Cap"] = (h_vec / denom)
+                for a in asset_names:
+                    num = price_df.at[a, tt] * z_val.loc["z_jt", (a, t)]
+                    weights.loc[(slice(None), t), a] = (num / denom)
+            else:
+                weights.loc[(slice(None), t), rf_asset]   = (cash_vec / denom).values
+                weights.loc[(slice(None), t), "Human Cap"] = (h_vec / denom).values
+                for a in asset_names:
+                    num = price_df.at[a, tt] * z_val.loc["z_jt", (a, t)]
+                    weights.loc[(slice(None), t), a] = (num / denom).values
 
             weights.loc[(slice(None), t), :] = (weights.loc[(slice(None), t), :] * 100).fillna(0.0)
 
@@ -346,17 +409,26 @@ def investment_ratio(rho_df, asset_names, sol, v0_val, h0_val, v_val, h_val, z_v
 
         # Scenario-mean by period
         weights_mean_by_t = weights.groupby(level="t").mean().round(2)
-        print(f"全シナリオ平均の投資比率％ (初期富：{W_0}, 目標富：{W_E}, 期待富：{W_G})")
+        print(f"Investment Weight: Senario Average (W_0:{W_0}, W_E:{W_E}, W_G:{W_G})")
         display(weights_mean_by_t)
         # Plot with integer x-axis labels
         ax = weights_mean_by_t.plot(
-            ylabel="投資比率（％）", figsize=(12, 6), marker="o"
+            ylabel="Weight (%)", figsize=(12, 6), marker="o"
         )
         ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))  # <<< added line
-        plt.xlabel("期間")
-        plt.title("全シナリオ平均の投資比率")
+        plt.xlabel("Period")
+        plt.title("Investment Weight: Senario Average")
         plt.tight_layout()
+
+        p = Path(f"results/{param_type}/weights.png")
+        if not p.exists():
+            plt.savefig(f"results/{param_type}/weights.png")
+
         plt.show()
+
+
+
+        return weights
 
 def max_exp_wealth(exval_std_df, W_0, W_E):
     # exval_std_df : rows MultiIndex(["統計量"]), cols MultiIndex(["資産名","期間"])
@@ -404,22 +476,21 @@ def max_exp_wealth(exval_std_df, W_0, W_E):
     display(max_path_df)
 
 
-def asset_composition(sol, rho_df, r_df, asset_names, v0_val, v_val, z_val, y_val, initial_call_rate, SCEN, TIME, W_0, W_E, W_G):
+def asset_composition(sol, rho_df, r_df, asset_names, v0_val, v_val, z_val, y_val, I, T, W_0, W_E, W_G, param_type, initial_call_rate=0.001):
+    
+    SCEN = [i+1 for i in range(I)]       
+    TIME = list(range(1, T+1))
+
     avg_price = rho_df.mean(axis=0)  
-    risk_assets = asset_names[1:]
-    rf_asset = asset_names[0]
-    assets = list(risk_assets)
-    all_cols_post = ["富"] + [rf_asset] + ["賃金"] + assets
+    rf_asset = "Cash"
+    all_cols_post = ["Wealth"] + [rf_asset] + ["Wage"] + asset_names
 
     # Check solve status once (PySCIPOpt getStatus() returns strings like "optimal", "infeasible", etc.)
     status_ok = (sol.get("status") == "optimal") and (sol.get("obj") is not None)
 
     if not status_ok:
-        print("資産構成は計算できません")
+        print("cannot calculate asset composition")
     else:
-
-    
-
         # Build one tidy weights table: index = (scenario i, time t)
         post_weights = pd.DataFrame(
             index=pd.MultiIndex.from_product([SCEN, TIME], names=["i", "t"]),
@@ -431,7 +502,7 @@ def asset_composition(sol, rho_df, r_df, asset_names, v0_val, v_val, z_val, y_va
             for t in TIME:
                 # --- compute risky & cash values ---
                 risky_val = 0.0
-                for a in assets:
+                for a in asset_names:
                     # Use average asset price (no scenario dependence)
                     price = (avg_price[a][t])
                     units = (z_val.at["z_jt", (a, t-1)])
@@ -440,25 +511,25 @@ def asset_composition(sol, rho_df, r_df, asset_names, v0_val, v_val, z_val, y_va
                 if t == 1:
                     cash_pre = (1 + initial_call_rate) * v0_val
                 else:
-                    cash_pre =  ( 1 + r_df.loc[i,t-1].values) * float(v_val.loc[i, t-1])
+                    cash_pre =  ( 1 + r_df.loc[i,t-1]) * v_val.loc[i, t-1]
                 
-                y_t = y_val.loc[i, t]
+                y_it = y_val.loc[i, t]
 
-                denom  = risky_val + cash_pre + y_t
+                denom  = risky_val + cash_pre + y_it
 
                 if denom <= 0:
                     post_weights.loc[(i, t), :] = 0.0
                 else:
                     # Risk-free (cash) weight first
                     post_weights.loc[(i, t), rf_asset] = np.round(cash_pre, decimals=2)
-                    post_weights.loc[(i, t), "賃金"] = y_t 
+                    post_weights.loc[(i, t), "Wage"] = y_it 
                     # Risky asset weights
-                    for a in assets:
+                    for a in asset_names:
                         price = (avg_price[a][t])
                         units = float(z_val.at["z_jt", (a, t-1)])
                         post_weights.loc[(i, t), a] = np.round(price * units, decimals=2) 
                     
-                post_weights.loc[(i, t), "富"] = np.round(denom, decimals=2)
+                post_weights.loc[(i, t), "Wealth"] = np.round(denom, decimals=2)
 
         # Re-order columns (just in case)
         post_weights = post_weights[all_cols_post] 
@@ -466,40 +537,32 @@ def asset_composition(sol, rho_df, r_df, asset_names, v0_val, v_val, z_val, y_va
 
         # Scenario-average portfolio composition per period
         post_weights_mean_by_t = post_weights.groupby(level="t").mean().round(2)
-        print(f"全シナリオ平均の資産構成 (初期富：{W_0}, 目標富：{W_G}, 期待富：{W_E})")
+        print(f"Asset Composition: Scenario Average (W_0:{W_0}, W_G:{W_G}, W_E:{W_E})")
         display(post_weights_mean_by_t)
         display((post_weights_mean_by_t[post_weights_mean_by_t.columns[1:]]).plot(kind="bar", figsize=(12,6), stacked=True))
+        p = Path(f"results/{param_type}/asset_comp.png")
+        if not p.exists():
+            plt.savefig(f"results/{param_type}/asset_comp.png")
+        
+        return post_weights
 
-def show_skill_chg(sol):
+def show_skill_chg(sol, param_type):
     # Check solve status once (PySCIPOpt getStatus() returns strings like "optimal", "infeasible", etc.)
     status_ok = (sol.get("status") == "optimal") and (sol.get("obj") is not None)
 
     if not status_ok:
         print("uは計算できません")
     else:
-        # 2) Chosen segment per (i,t) as an integer k
-        chosen = sol["u_choice"]                  # index: (i,t) → k
-        chosen_df = chosen.unstack("t")           # rows=i, cols=t
-        chosen_df.columns.name = "t"
-        chosen_df.name = "chosen_k"
-
-        # 3) How skill level changes over time (counts per t)
-        counts_by_t = chosen.groupby(level="t").value_counts().unstack(fill_value=0)
-        counts_by_t.index.name = "t"
-        counts_by_t.columns.name = "k"
-        print("Segment counts by period:")
-        display(counts_by_t)
-
-        # --- Average skill level by t ---
-        avg_k_by_t = chosen.groupby(level="t").mean()
-
+        u_df = (sol["u"].abs() > 0.5).astype(int)
+        display(u_df)
+        k_by_t = u_df.T.idxmax(axis=1).str.replace("k=", "").astype(int)
         # --- Plot ---
         fig, ax = plt.subplots(figsize=(10, 5))
-        ax.plot(avg_k_by_t.index, avg_k_by_t.values, marker="o", color="C0")
+        ax.plot(k_by_t.index, k_by_t.values, marker="o", color="C0")
 
-        ax.set_title("平均スキル段階の推移 (k の平均)")
-        ax.set_xlabel("期間 t")
-        ax.set_ylabel("平均スキル段階 k")
+        ax.set_title("average skill level (average k)")
+        ax.set_xlabel("Period")
+        ax.set_ylabel("k")
 
         # Integer tick control
         ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
@@ -508,6 +571,9 @@ def show_skill_chg(sol):
 
         ax.grid(True, linestyle="--", alpha=0.6)
         plt.tight_layout()
+        p = Path(f"results/{param_type}/skill_level.png")
+        if not p.exists():
+            plt.savefig(f"results/{param_type}/skill_level.png")
         plt.show()
 
 def max_exp_wealth_with_hc_reinvest(
@@ -545,8 +611,7 @@ def max_exp_wealth_with_hc_reinvest(
         if taus[j] <= taus[j-1] + EPS:
             taus[j] = taus[j-1] + EPS
 
-    K = len(taus) - 1
-    beta = list(map(float, beta))[:K]                       # 区間数に合わせる
+    K = len(beta)                    
 
     # 到達可能上限 H_max[t] に対応する最大賃金 y_t
     y_by_t = []
@@ -601,3 +666,5 @@ def max_exp_wealth_with_hc_reinvest(
         print("⚠️ 期待富 W_E が大きすぎます（賃金の全額積立でも未達）")
 
     return out
+
+
